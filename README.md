@@ -1,393 +1,167 @@
-# Flexgate Design Risks
+# Flex AI Platform: Architecture Summary
 
-This note summarizes the main risks in the flexgate proposal in plain language. It focuses on the areas most likely to affect customer traffic, billing correctness, operations, and rollout safety.
+Covers four sibling repos: **token-service**, **fleet-manager**, **fcs**, **infra**.
 
-## Executive Summary
+> Source: parallel read-only analysis of each repo (docs, entry points, grep for cross-repo references). Not every doc was read in depth, and runtime behaviour was not verified. Treat dated migration plans and runbooks as decision records, not current state.
 
-The performance case for flexgate is strong: the current LiteLLM path is expensive, slow to scale, and fragile under high streaming load. The main risk is not whether a Go data plane can be faster. The main risk is that the proposal changes too many critical systems at once:
+---
 
-- request routing
-- billing event generation
-- balance enforcement
-- usage durability
-- rollout fences
-- dashboards and admin readers
-- Skupper transport topology
-- operational ownership
+## 1. One-paragraph model
 
-This makes the design harder to verify, debug, and roll back.
+- **token-service** is the customer-facing inference API (`api.flex.ai/v1`, `tokens.flex.ai`) and the billing/identity back-office. It sells tokens but does not run GPUs.
+- **fleet-manager** is the admin control plane for the GPU fleet and model serving. It decides which GPUs run which models and tells token-service what is serving and what may be sold.
+- **fcs** ("fcsv1") is the training and dedicated-inference PaaS: console, CLI, a Go system of record and an in-cluster operator.
+- **infra** is the GitOps/IaC monorepo that deploys the other three. The app repos publish charts and images to GAR; infra pins versions and Flux applies them.
 
-## Why the Flexgate Go Plane Helps
+The same physical GPU clusters (e.g. smc-001) serve both token-service inference and fcs training. fleet-manager's `tier-controller` arbitrates GPU ownership.
 
-Flexgate is helpful because it moves the performance-sensitive request path out of LiteLLM's Python proxy and into a smaller Go data plane built for streaming inference traffic.
+## 2. System diagram
 
-### 1. Lower CPU per request
+```
+                  ┌──────────── infra (GitOps / Pulumi / Ansible) ────────────┐
+                  │ clusters.yaml + environments.yaml → generated k8s/<cluster>│
+                  │ Flux HelmReleases pin charts from GAR; OpenBao; Skupper    │
+                  └──────┬──────────────────┬──────────────────┬──────────────┘
+                 deploys │                  │                  │
+                         ▼                  ▼                  ▼
+ customers ─► token-service ◄── feeds ── fleet-manager ──HTTP/Skupper──► cluster-agent (per GPU cluster)
+ api.flex.ai  Envoy → LiteLLM/flexgate   /api/serving/live               tier-controller (GPU owner)
+              portal-api (FastAPI)       /api/catalog/models                      ▲
+              global/regional Postgres        ▲                                   │ /allocate /heartbeat /release
+                   │ ▲                        │ reads prices from                 │
+  identity/org SSOT│ │ managed proxy          │ flexaihq/artifacts           fcs flex-agent
+  + gpu-pricing    ▼ │ + usage windows                                             ▲
+                  fcs: platform BFF ─► experience (Go) ──Temporal / gRPC over Skupper┘
+                  console, CLI, Lago billing
+```
 
-LiteLLM does a lot of expensive work on the hot path: Python event-loop work, pydantic object rebuilds, per-chunk parsing, re-serialization, hooks, SDK overhead, and database-adjacent logic. The doc's measurements show flexgate using much less CPU per request than LiteLLM in the same-box tests.
+## 3. Repo summaries
 
-Why this helps:
+### 3.1 token-service
 
-- More requests can be served with fewer cores.
-- The system has more headroom during spikes.
-- Rejections and overload handling can be cheaper.
+**Role:** OpenAI-compatible inference gateway, per-user/org virtual keys, rate limits, budgets, metering, Stripe/wallet/credit-ledger billing, portal SPA and customer docs source.
 
-### 2. Better fit for streaming
+**Components (namespace `token-service`)**
+- LiteLLM proxy with custom hooks (`backend/litellm_hooks/*`): admission gate, usage guard, rpm gate, request validator, activation gate and others.
+- `flexgate/`: a Go data plane being introduced beside LiteLLM (Redis Lua, Pub/Sub usage logs).
+- Portal API (`backend/`, FastAPI). One image; `APP_ROLE` selects `control`, `media`, `worker` (all billing/metering loops) or `usage-ingest`.
+- Portal SPA (`portal/`), `statuspage-sync/` CronJob, `runtimes/*` (TTS/OCR images), `flexserve-patch/`.
 
-Inference responses are long-lived streaming requests. A thin Go relay can keep per-chunk work small and predictable.
+**Request path:** Envoy Gateway → `/v1/*` to LiteLLM (carve-outs to portal-api for `/v1/images|audio|videos|models|pricing`), `/api/*` to portal-api, `/*` to the SPA → LiteLLM → vLLM/SGLang/KServe pods on GPU clusters over Skupper listeners (`k8s/skupper-hub/`).
 
-Why this helps:
+**Data:** Postgres via raw asyncpg (all SQL in `backend/database.py`), no ORM. A `global` schema (orgs, billing, ledger, memberships) is split from regional tables (keys, usage); no SQL may join across them (`make db-guard`). Redis for flexgate/rate limits. Numbered migrations in `backend/migrations/` and `backend/migrations-regional/`.
 
-- Less work per SSE chunk.
-- Fewer allocations and less object churn.
-- Better behavior under many concurrent streams.
-- Cleaner backpressure and admission control.
+**Catalog:** `model_display`, `model_route`, `model_pricing`. `backend/fleet_publish.py` is the only writer, sweeping every ~5 minutes. Brakes: observe-only, per-sweep caps, "no signal means no write". `fleet_liveness.py` decides what `/v1/models` lists.
 
-### 3. Faster startup and scaling
+**Auth:** Ory OIDC with BFF cookie session. token-service is the SSOT for users and orgs.
 
-LiteLLM pods are slow to become ready because they carry a heavier Python application and startup path. Flexgate is designed to boot quickly and read control-plane state from snapshots.
+**Deploy:** GKE + Flux. Dev floats on main; staging is pinned per RC; prod is promoted by a human-reviewed infra PR bumping `chartVersion` in `k8s/clusters.yaml`.
 
-Why this helps:
+**Read first:** `docs/end-to-end-architecture.md` (current; `docs/architecture.md` is stale), `docs/fleet-publish-sweep.md`, `backend/fleet_publish.py`.
 
-- Faster scale-out during traffic spikes.
-- Lower need for a large always-on LiteLLM floor.
-- Easier use of autoscaling once admission metrics are trusted.
+### 3.2 fleet-manager
 
-### 4. Explicit overload behavior
+**Role:** Teleport-gated admin control plane (Clusters, Models, Catalog tabs). Owns serving placement, perf scorecards and Catalog operator facts. `flexaihq/artifacts` owns prices, context, quant and legal facts; the contract is `ai-specs/contracts/artifacts-fleet-contract.toml` (locked, v1.1.0).
 
-The current path can turn saturation into 504s or hidden edge-level failures. Flexgate is designed to reject overload quickly with 429s and `Retry-After`, while preserving 5xx for actual failures.
+**Components**
+- Hub: one FastAPI + React image (`backend/main.py`, `portal/`) with its own Postgres.
+- Per GPU cluster: `cluster-agent` (inventory, scaling, stage jobs, weight purge) and `tier-controller` (admission webhook on KServe pods, 60s decision loop, defrag, external lease API).
+- Also: `snapshot-plane` (GPU snapshot/restore), `tt-device-plugin` and `tt-exporter` (Tenstorrent), `serving-images/*`, `audex-serve`, `parakeet-serve`, `wan-serve`, `kv-cache-sim`.
 
-Why this helps:
+**Hub ↔ cluster:** HTTP with a bearer over Skupper (`backend/cluster_agent_client.py`, `fleet_cache.py`; roster via `CLUSTER_AGENT_<NAME>_URL`). Mutations write an audit row in the same transaction.
 
-- Clients get clearer retry signals.
-- Overload is cheaper for the system.
-- Operators can distinguish capacity pressure from broken infrastructure.
+**Publishing pipeline:** artifacts row → fleet-manager Catalog → cluster-agent creates InferenceService/Connector → hub Skupper Listener (infra GitOps PR) → token-service sweep writes catalog and LiteLLM routes.
 
-### 5. Cleaner separation of data plane and control plane
+**Tiering:** `desired_hot = clamp(demand, max(floor,1), ceiling)`. Only cold park remains (drain, delete, restore from snapshot or cold boot); warm/hibernate parking was retired 2026-09-05.
 
-The architecture moves fast request handling into flexgate and slower-changing policy/configuration into snapshots and changelogs.
+**Read first:** `docs/model-publishing.md`, `backend/main.py`, `tier-controller/src/tier_controller/webhook.py`.
 
-Why this helps:
+### 3.3 fcs
 
-- The hot path avoids repeated database calls.
-- Key/model/org/routing state can be refreshed outside the request path.
-- Both LiteLLM and flexgate can eventually consume the same projected control-plane state.
+**Role:** `flexai training run` / `flexai inference serve`, console at console.flex.ai, CLI.
 
-### 6. More durable usage recording
+**Layers**
+- `platform/`: Python 3.12 FastAPI BFF (stateless), React 19 console, Go CLI, generated clients (do not hand-edit).
+- `experience/`: Go system of record (Gin, GORM, Atlas) owning Postgres; commands `backend`, `worker` (Temporal), `dash`.
+- `experience/flex-agent`: in-cluster operator. The backend pushes desired state over a clusterlink gRPC stream tunneled by Skupper; flex-agent creates `compute.flex.ai` Training/Inference CRs, and Flux renders the `flexai-training` chart.
+- Billing: batch job (every 10 min) reads the experience DB and pushes GPU-hours × rate to Lago.
 
-Flexgate explicitly records usage before sending `[DONE]`, instead of relying on LiteLLM's delayed SpendLogs batch flush.
+**GPU leasing:** flex-agent calls tier-controller `POST /allocate`, then pins workloads with `NVIDIA_VISIBLE_DEVICES=GPU-<uuid>` (no device-plugin fallback). Leases are in-memory in tier-controller, so a 404 on heartbeat triggers re-allocation.
 
-Why this helps:
+**Read first:** `docs/architecture.md`, `docs/workload-runbook.md`, `experience/flex-agent/internal/controller/`.
 
-- Fewer lost usage records when pods die.
-- Better audit trail for finished, failed, and cancelled requests.
-- Cleaner path to request-time frozen pricing.
+### 3.4 infra
 
-### 7. Safer incremental migration
+**Role:** desired state of every cluster (`k8s/`), cloud/secrets/DNS provisioning (`pulumi/`), host and cluster bring-up (`ansible/`, workflows).
 
-The proposed `off` / `ready` / `on` modes and per-org/model fences let flexgate be provisioned before it carries traffic.
-
-Why this helps:
-
-- Infrastructure can be deployed dark.
-- Traffic can move gradually.
-- Rollback can be a routing/fence change rather than a full redeploy, assuming billing and usage state are handled correctly.
-
-### 8. Architectural focus
-
-LiteLLM remains useful for compatibility, admin paths, and fallback. Flexgate focuses on the narrow high-volume path: accepting a request, enforcing lightweight controls, relaying the stream, and producing usage.
-
-Why this helps:
-
-- The busiest path becomes smaller and easier to reason about.
-- The system can optimize the 99% path without carrying all LiteLLM complexity.
-- Future scaling work can target a purpose-built component rather than a general Python proxy.
-
-The core value is therefore sound: flexgate can make the inference gateway cheaper, faster to scale, and more predictable under streaming load. The risks below are mostly about whether the first release is scoped tightly enough and whether billing/control-plane correctness is proven before customer traffic moves.
-
-## Highest-Risk Areas
-
-### 1. Billing Correctness
-
-Flexgate introduces a new usage-event path that is meant to replace or run beside LiteLLM SpendLogs.
-
-Risks:
-
-- Some traffic may be billed through new flexgate usage events while existing dashboards and admin tools still read LiteLLM SpendLogs.
-- Cancel and disconnect billing semantics changed late in the design. Older code, tests, or docs may still assume "delivered tokens only."
-- Different engine arms have different capabilities. A cancel may bill using engine abort counts on one arm and delivered estimates on another.
-- Void/refund behavior is complex. A chargeable event may later need to become non-chargeable if the client did not actually receive the response.
-- Aggregate billing is scalable, but it can make per-request disputes harder unless request-level audit records remain easy to query.
-
-Why it matters:
-
-Billing bugs become customer trust, finance, and audit problems. They are harder to fix after traffic has already moved.
-
-Recommended gates:
-
-- Two-human review of billing, finalize, usage ingest, void, and reconciliation code.
-- End-to-end tests for success, engine fault, gateway fault, client disconnect, cancel, retry, duplicate event, and replay.
-- Confirm all customer/admin usage readers handle flexgate traffic before any billed org moves.
-
-## 2. Control Plane and Balance Model
-
-The control plane supplies snapshots, changelogs, fences, capability flags, balance state, and rollout decisions.
-
-Risks:
-
-- The balance model is still an open decision: leases versus a simpler snapshot/counter model.
-- The lease/re-anchor/reclaim/reaper design is effectively a distributed accounting system.
-- Redis-gw becomes safety-critical for fences and balance. A redis-gw outage could block traffic or create inconsistent admits.
-- Stale snapshots can cause wrong routing, wrong billing treatment, wrong access decisions, or wrong model availability.
-- Revocation and re-enable flows are delicate. A stale revocation overlay could keep a re-enabled key dead for too long.
-
-Why it matters:
-
-The control plane decides who can send traffic, where traffic goes, and whether money can be spent. Bugs here can cause outages or incorrect charging.
-
-Recommended gates:
-
-- Decide and document the balance model before prod.
-- Test stale snapshot, missed changelog, redis-gw outage, rollback, and key revocation/re-enable cases.
-- Prefer a simpler phase 1 balance model if the first target is an exempt OpenRouter-style org.
-
-## 3. Dual-Plane Rollout Risk
-
-During migration, LiteLLM and flexgate may both exist on the request path.
-
-Risks:
-
-- The per-org/model fence must keep the two planes from admitting the same traffic incorrectly.
-- LiteLLM grace periods, flexgate fence cache TTLs, and settle-on-release logic must all line up.
-- Rollback is described as a fence flip or `mode: ready`, but in-flight usage, unsettled balance, and replayed events may make rollback messier.
-- Enabling the fence on LiteLLM can introduce a new dependency on redis-gw before flexgate carries traffic.
-
-Why it matters:
-
-A migration should not make the incumbent LiteLLM path less reliable before the new path is proven.
-
-Recommended gates:
-
-- Run full dual-plane tests with traffic moving both directions.
-- Test redis-gw failure while LiteLLM is still serving.
-- Prove rollback with in-flight streams and unsettled usage.
-
-## 4. Database and Schema Changes
-
-The design mentions additive schema changes, especially migrations 414 and 415, plus new usage/billing schema from the usage pipeline.
-
-Risks:
-
-- "Off mode" is not truly byte-identical if schema changes still run.
-- Migration 414 depends on the `flexgate_usage` Postgres role existing first.
-- If the role/runbook step is missed, grants may not apply as expected.
-- Existing SpendLogs readers may not see flexgate-served traffic.
-- The billing ledger currently lacks a dedicated usage void/reversal type, so voids may appear as generic adjustments.
-
-Why it matters:
-
-Additive schema is safer than destructive schema, but it can still create broken readers, missing permissions, or audit ambiguity.
-
-Recommended gates:
-
-- List the exact new tables, roles, grants, indexes, and readers before staging.
-- Confirm every environment has the required role before migration.
-- Add explicit tests that dashboards, exports, admin views, request lookup, and billing reconciliation see flexgate traffic.
-
-## 5. Usage Durability and Replay
-
-Flexgate must durably record usage before sending `[DONE]`.
-
-Risks:
-
-- Pub/Sub, Postgres fallback, disk spool, replay jobs, format versions, and gap detection form a complex finalize chain.
-- Pod death during finalize may produce duplicate, missing, or delayed usage events.
-- Spool format changes require careful drain/upgrade behavior.
-- Per-pod persistent disk spool adds operational complexity.
-
-Why it matters:
-
-This path sits directly between customer response completion and billing correctness.
-
-Recommended gates:
-
-- Chaos test pod death before publish, after publish, before `[DONE]`, and during replay.
-- Prove idempotency for duplicate events.
-- Prove safe replay across version changes.
-- Consider simplifying the first release to Pub/Sub plus a smaller local fallback if acceptable.
-
-## 6. Observability and Customer Support Gaps
-
-Existing alerts and dashboards are built around LiteLLM metrics and SpendLogs.
-
-Risks:
-
-- Flexgate traffic may disappear from current customer usage pages.
-- Admin request lookup may not find flexgate requests.
-- Error-rate alerts based on LiteLLM metrics may go blind for moved traffic.
-- Support may not know which request ID customers should quote.
-
-Why it matters:
-
-If a customer reports a billing or latency issue, support must be able to trace the request across edge, flexgate, engine, usage event, and ledger.
-
-Recommended gates:
-
-- One canonical customer-facing request ID.
-- Request lookup works for both LiteLLM and flexgate.
-- Alerts cover both planes before production traffic moves.
-- Dashboards clearly distinguish old and new usage sources where needed.
-
-## 7. Skupper and Transport Uncertainty
-
-The design reduces LiteLLM cost, but Skupper may become the next bottleneck.
-
-Risks:
-
-- The single-router ceiling is still not fully proven.
-- Real 10x/100x load through Skupper is not yet verified.
-- Sharding Skupper before measuring could overbuild expensive infrastructure.
-- Running heavy load tests through shared Skupper infrastructure could create an incident.
-
-Why it matters:
-
-If Skupper becomes the limiting factor, flexgate may be fast but the whole path still bottlenecks elsewhere.
-
-Recommended gates:
-
-- Measure Skupper versus an alternative tunnel path before major infra commitments.
-- Use dedicated load-test infrastructure, not shared production routers.
-- Derive shard count from measured router ceiling and real demand.
-
-## 8. Capacity and Demand Assumptions
-
-The proposal often discusses 100x current peak.
-
-Risks:
-
-- The 100x target may not match actual OpenRouter demand.
-- Infrastructure may be sized for hypothetical demand rather than advertised/contracted demand.
-- The design may reserve quota and capacity before the demand curve is agreed.
-
-Why it matters:
-
-Overbuilding increases cost and complexity. Under-measuring increases outage risk.
-
-Recommended gates:
-
-- Get a 30/60/90-day demand curve from OpenRouter owners.
-- Size the first release to admitted engine capacity plus headroom, not hypothetical request volume.
-- Treat excess demand as a controlled 429 budget.
-
-## 9. Per-Tenant Fairness
-
-Admission control is mostly per-pod and per-arm.
-
-Risks:
-
-- A high-volume aggregator or exempt org can consume all active stream capacity.
-- Direct paying customers may receive 429s while aggregator traffic continues.
-- OpenRouter exemption from prepaid balance could bypass one form of protection unless paired with explicit org caps.
-
-Why it matters:
-
-Protecting one large partner should not starve normal customers.
-
-Recommended gates:
-
-- Add per-org or per-tenant active request limits.
-- Carry per-org caps in the control-plane snapshot.
-- Set aggregator caps to advertised capacity plus agreed headroom.
-
-## 10. Behavior Parity and Missing Features
-
-Flexgate aims for parity with LiteLLM, with documented exceptions.
-
-Risks:
-
-- Exact parity increases implementation complexity.
-- Some current behavior may not be ported, such as tool-choice enforcement or TPM limits.
-- Some LiteLLM quirks may not be worth preserving.
-- A byte-level parity bar may slow delivery and keep bad behavior alive.
-
-Why it matters:
-
-Customers care about stable behavior, but not every LiteLLM quirk is a product contract.
-
-Recommended gates:
-
-- Decide the parity bar explicitly.
-- Separate "must preserve" API contracts from "LiteLLM implementation quirks."
-- Add tests for product-visible behavior, not only byte-for-byte output.
-
-## 11. Operational Ownership
-
-Flexgate introduces a Go service into a path currently dominated by Python/LiteLLM.
-
-Risks:
-
-- The team needs Go production debugging skills.
-- On-call must handle goroutine leaks, GC stalls, h2/h2c issues, replay bugs, and admission bugs.
-- Runbooks may lag the new system.
-
-Why it matters:
-
-A faster system is not safer unless the on-call team can debug it at 3 a.m.
-
-Recommended gates:
-
-- Name Go on-call owners.
-- Create runbooks for overload, replay backlog, Pub/Sub outage, redis-gw outage, stuck fence, and billing reconciliation.
-- Add dashboards for Go runtime, queueing, admission, finalize, replay, and upstream transport.
-
-## 12. Security and Secrets
-
-The design introduces or depends on several sensitive credentials and tokens.
-
-Risks:
-
-- Abort tokens span multiple environments/clusters.
-- redis-gw credentials are shared by multiple components.
-- The doc mentions exposed OpenBao/dev secrets that still need rotation.
-- Static DB logins for `flexgate_usage` were chosen over Vault-issued ones.
-
-Why it matters:
-
-Gateway credentials sit on a high-value request and billing path.
-
-Recommended gates:
-
-- Rotate exposed tokens before production.
-- Document credential ownership and rotation procedures.
-- Confirm least-privilege grants for `flexgate_usage`.
-- Audit which services can read/write redis-gw state.
-
-## Suggested Safer Phase 1
-
-A lower-risk first release would be:
-
-- OpenRouter-focused only.
-- Metered, but exempt from prepaid balance.
-- No lease-based balance subsystem in phase 1.
-- RPM and per-org/arm caps enforced.
-- Usage events durable and visible in dashboards/admin tools.
-- Billing/finalize code human-reviewed.
-- Skupper path measured before large infra commitments.
-- Clear rollback tested with in-flight requests.
-
-This still validates the core flexgate value: cheaper, faster request relay under real traffic, without coupling the first launch to every billing and balance mechanism.
-
-## Go / No-Go Checklist
-
-Before production `on`, require:
-
-- [ ] Balance model decision recorded.
-- [ ] Two-human review of billing/finalize/control-plane money paths.
-- [ ] Dashboard, export, admin, and request lookup support flexgate traffic.
-- [ ] Cancel/disconnect billing tests pass across old and new arms.
-- [ ] Duplicate, replay, void, and pod-death usage tests pass.
-- [ ] Redis-gw outage behavior is tested.
-- [ ] Rollback is tested with in-flight traffic.
-- [ ] Per-tenant fairness limits exist.
-- [ ] Skupper ceiling is measured.
-- [ ] Production runbooks and owners exist.
-- [ ] Exposed secrets are rotated.
+**Key pieces**
+- `k8s/clusters.yaml` (~16k lines) + `k8s/environments.yaml` → rendered by `make generate-resources` into `k8s/<cluster>/`. **Never hand-edit generated dirs.**
+- Pulumi (Python), state in a GCS bucket with KMS. Projects: vault-v2, secrets-sync, teleport, gcp/*, cloudflare_*, grafana-*, byoc and more.
+- `ansible/` for host config and k3s; `byoc-tool/` for customer BYOC clusters on AWS/Azure.
+- OpenBao (Vault fork) for secrets, consumed through vault-secrets-operator. About 70 GitHub workflows for onboarding, Pulumi, e2e and chart publishing.
+- Tiers: INFRA-DEV → INTERNAL-STAGING → INTERNAL-PROD → CLIENT-PROD.
+
+**Topology**
+- GKE control planes in project `fcs-production-cluster`: backoffice (OpenBao, Teleport, fleet-manager, staging token-service) and prod token-service (US/EU).
+- GPU/edge clusters on k3s: smc-001, mi300x, jarvis, Tenstorrent, arm64, BYOC templates.
+- fcs's control plane is being folded into the prod token-service cluster (plan 2026-07-28). Scaleway is being decommissioned.
+
+**Read first:** `AGENTS.md`, `k8s/clusters.yaml`, `scripts/src/flexai/`, relevant `runbook-*.md`.
+
+## 4. Cross-repo connections
+
+| From → To | Mechanism | Key files |
+|---|---|---|
+| token-service → fleet-manager | polls `GET /api/serving/live` and `GET /api/catalog/models`, shared bearer over Skupper | token-service `backend/fleet_publish.py`, `fleet_liveness.py`; fleet-manager `backend/serving_registry_api.py`, `catalog_api.py` |
+| fleet-manager → cluster-agent / tier-controller | HTTP over Skupper | `backend/cluster_agent_client.py` |
+| fcs flex-agent → tier-controller (fleet-manager) | `POST /allocate`, `/heartbeat/{lease}`, `/release/{lease}`; sends `display_name`, `org_name` so the cluster page shows names | fcs `experience/flex-agent/internal/tierclient/`; fleet-manager `tier-controller/` |
+| fcs → token-service | internal HTTP + bearer: user/org SSOT, `gpu-pricing/lookup`; billing-block verdict back via `PUT /admin/organization/{id}/billing-block` | fcs `experience/backend/internal/tokenservice/client.go` |
+| token-service → fcs | `/api/managed/v1/*` proxy injecting `X-Ory-User-Id`; pulls `/admin/usage/windows` | token-service `backend/managed_proxy.py`, `managed_usage_client.py` |
+| token-service portal ← fcs UI | fcs console frontend vendored into the portal (hash-checked) | token-service `portal/src/managed-console/` |
+| fleet-manager → infra | dispatches infra workflows (cluster deploy, onboarding, Skupper listener PRs) | fleet-manager `backend/github_client.py` |
+| infra → fleet-manager | cluster-enrol workflow dispatches fleet-manager to edit the `clusterAgents.listeners` roster | infra `.github/workflows/setup_k3s_training_cluster.yml` |
+| infra ↔ token-service | pin workflows edit `clusters.yaml`; merged pins dispatch release events back | infra `scripts/set_token_service_pin.py`, `token-service-*.yml` |
+| infra → all three | HelmRepository + HelmRelease per chart, pinned versions | infra `k8s/k8s-templates/helm-releases/`, `k8s/environments.yaml` |
+
+Fleet-manager has no code dependency on fcs; the only link is the lease-metadata fields above.
+
+## 5. Shared infrastructure
+
+- **Skupper:** cross-cluster plumbing. Hub listeners live on the GKE token-service clusters (infra-owned via Flux); serving clusters hold connectors. Listener port must equal Connector port.
+- **GAR:** all app charts and images publish to `us-west2-docker.pkg.dev/fcs-production-cluster/*`.
+- **Ory:** auth.flex.ai points at token-service's Ory project.
+- **Teleport:** fronts fleet-manager.
+- **OpenBao:** secrets for all clusters, per-cluster JWT auth mounts.
+
+## 6. Key flows
+
+1. **Publish a model:** artifacts row → fleet-manager Catalog → cluster-agent IS/Connector → hub Listener (infra PR) → token-service sweep (~5 min) → `/v1/models` and LiteLLM route.
+2. **Inference request:** client → Envoy → LiteLLM/flexgate (key, rate, budget, activation gates) → Skupper → vLLM/SGLang pod → usage metering → billing.
+3. **Training job:** console/CLI → platform BFF → experience → Temporal → clusterlink gRPC → flex-agent → tier-controller lease → Training CR → Flux/chart → pod pinned to leased GPUs → usage → Lago.
+4. **Deploy:** repo publishes chart to GAR → bot PR to infra bumps pin → merge → Flux applies (prod via human-reviewed PR).
+5. **Identity:** token-service is SSOT; fcs resolves Ory sub through it (60s cache, fails open to local mirror, dormant unless URL and token env vars are set).
+
+## 7. Gotchas
+
+- Never hand-edit infra's generated `k8s/<cluster>/` dirs or `kubectl edit` live resources; Flux/VSO overwrites them.
+- Adding a model is not a token-service change. Do it through artifacts and the fleet-manager Catalog; do not hand-UPDATE catalog columns the sweep re-asserts.
+- Any `/v1` route carve-out needs a change in both token-service (chart) and infra (edge Gateway).
+- Prod fleet feed flags (`SERVING_FEED_PER_ARM`, etc.) are ordered against token-service deploys; check before flipping.
+- Teleport JWT audience for fleet-manager must be the internal Service URI, or it looks like a missing role.
+- Publishing a fleet-manager chart rolls the whole fleet; `make deploy-agent` / `deploy-tier-controller` are break-glass only (suspend the HelmRelease first).
+- tier-controller leases are in-memory; a restart drops them and flex-agent re-allocates.
+- fcs: a 403 in Vault namespace `admin` means a missing mount; `enqueued` does not mean waiting for GPUs; never edit generated clients.
+- Never run infra `secrets-sync` without the `VAULT_ADMIN_INFRA_DEV_*` credentials; it deletes fcsv1 training auth.
+- Documentation drift: fcs CLAUDE.md claims `token-service/` is in its monorepo (it is not); token-service CLAUDE.md references a `cluster-agent/` dir that does not exist there (it lives in fleet-manager); token-service `docs/architecture.md` is a stale 2026-04 snapshot.
+
+## 8. Where to start reading
+
+| Goal | Start at |
+|---|---|
+| Whole-system picture | token-service `docs/end-to-end-architecture.md` |
+| Model publishing | fleet-manager `docs/model-publishing.md` |
+| GPU scheduling | fleet-manager `tier-controller/docs/autoscaling-state-machine.md`, `external-allocation-api.md` |
+| Training workflow | fcs `docs/architecture.md`, `docs/workload-runbook.md` |
+| Identity/org SSOT | fcs `docs/auth-ssot-consolidation-plan.md`, `docs/eng-1492-handoff/` |
+| Deploy and release | infra `AGENTS.md`, token-service `docs/release-process.md`, fcs `docs/release-and-deploy.md` |
+| Incidents and history | infra `runbook-*.md` and `migration-plan-*.md` |
